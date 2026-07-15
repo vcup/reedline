@@ -166,6 +166,7 @@ pub struct Reedline {
     completer: Box<dyn Completer + Send>,
     quick_completions: bool,
     partial_completions: bool,
+    persistent_menus: bool,
 
     // Highlight the edit buffer
     highlighter: Box<dyn Highlighter>,
@@ -310,6 +311,7 @@ impl Reedline {
             completer,
             quick_completions: false,
             partial_completions: false,
+            persistent_menus: false,
             highlighter: buffer_highlighter,
             visual_selection_style,
             hinter,
@@ -467,6 +469,19 @@ impl Reedline {
     #[must_use]
     pub fn with_partial_completions(mut self, partial_completions: bool) -> Self {
         self.partial_completions = partial_completions;
+        self
+    }
+
+    /// Make active menus persist while the line is edited: erasing characters
+    /// or emptying the line refilters the menu instead of dismissing it.
+    ///
+    /// When disabled (the default), an active menu is deactivated by a backspace
+    /// when quick completions are on, and by any edit that leaves the line
+    /// buffer empty. A persistent menu still closes on Esc, Ctrl-C, or when a
+    /// value is accepted.
+    #[must_use]
+    pub fn with_persistent_menus(mut self, persistent_menus: bool) -> Self {
+        self.persistent_menus = persistent_menus;
         self
     }
 
@@ -1474,7 +1489,9 @@ impl Reedline {
                         match commands.first() {
                             Some(&EditCommand::Backspace)
                             | Some(&EditCommand::BackspaceWord)
-                            | Some(&EditCommand::MoveToLineStart { select: false }) => {
+                            | Some(&EditCommand::MoveToLineStart { select: false })
+                                if !self.persistent_menus =>
+                            {
                                 menu.menu_event(MenuEvent::Deactivate)
                             }
                             _ => {
@@ -1502,7 +1519,7 @@ impl Reedline {
                             }
                         }
                     }
-                    if self.editor.line_buffer().get_buffer().is_empty() {
+                    if !self.persistent_menus && self.editor.line_buffer().get_buffer().is_empty() {
                         menu.menu_event(MenuEvent::Deactivate);
                     } else {
                         menu.menu_event(MenuEvent::Edit(self.quick_completions));
@@ -3313,6 +3330,80 @@ mod tests {
         let insertion = EditCommand::InsertString(String::from("x"));
         reedline.run_edit_commands(&[insertion]);
         assert_eq!(reedline.current_buffer_contents(), "67x");
+    }
+
+    fn menu_is_active(reedline: &Reedline) -> bool {
+        reedline.menus.iter().any(|menu| menu.is_active())
+    }
+
+    /// Engine with a completion menu activated on a "th" buffer. "th" matches
+    /// two words, so quick completions don't auto-select on activation.
+    fn engine_with_active_menu(quick: bool, persistent: bool) -> Reedline {
+        let completer = Box::new(DefaultCompleter::new_with_wordlen(
+            vec![
+                String::from("test"),
+                String::from("this"),
+                String::from("that"),
+            ],
+            1,
+        ));
+        let completion_menu = ReedlineMenu::EngineCompleter(Box::new(
+            ColumnarMenu::default().with_name("completion_menu"),
+        ));
+        let mut reedline = Reedline::create()
+            .with_completer(completer)
+            .with_menu(completion_menu)
+            .with_quick_completions(quick)
+            .with_persistent_menus(persistent);
+
+        reedline.run_edit_commands(&[EditCommand::InsertString(String::from("th"))]);
+        reedline
+            .handle_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Menu(String::from("completion_menu")),
+            )
+            .unwrap();
+        assert!(menu_is_active(&reedline));
+        reedline
+    }
+
+    fn send_edit(reedline: &mut Reedline, command: EditCommand) {
+        reedline
+            .handle_event(
+                &DefaultPrompt::default(),
+                ReedlineEvent::Edit(vec![command]),
+            )
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(false, true)]
+    #[case(true, false)]
+    #[case(true, true)]
+    fn test_menu_persistence_while_erasing(#[case] quick: bool, #[case] persistent: bool) {
+        let mut reedline = engine_with_active_menu(quick, persistent);
+
+        // quick completions close the menu on any backspace unless menus are persistent
+        send_edit(&mut reedline, EditCommand::Backspace);
+        assert_eq!(reedline.current_buffer_contents(), "t");
+        assert_eq!(menu_is_active(&reedline), persistent || !quick);
+
+        // emptying the buffer closes the menu unless menus are persistent
+        send_edit(&mut reedline, EditCommand::Backspace);
+        assert!(reedline.current_buffer_contents().is_empty());
+        assert_eq!(menu_is_active(&reedline), persistent);
+    }
+
+    #[rstest]
+    #[case(EditCommand::BackspaceWord)]
+    #[case(EditCommand::MoveToLineStart { select: false })]
+    fn test_menu_persistence_covers_all_quick_dismissal_commands(#[case] command: EditCommand) {
+        for persistent in [false, true] {
+            let mut reedline = engine_with_active_menu(true, persistent);
+            send_edit(&mut reedline, command.clone());
+            assert_eq!(menu_is_active(&reedline), persistent);
+        }
     }
 
     /// A hinter that always offers a fixed suggestion, so the completion flow can
