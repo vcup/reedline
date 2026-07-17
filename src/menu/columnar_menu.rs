@@ -2,8 +2,9 @@ use super::{Menu, MenuBuilder, MenuEvent, MenuSettings};
 use crate::{
     core_editor::Editor,
     menu_functions::{
-        can_partially_complete, floor_char_boundary, get_match_indices, replace_in_buffer,
-        resolve_completer_input, style_suggestion, truncate_with_ansi,
+        available_lines, can_partially_complete, floor_char_boundary, get_match_indices,
+        replace_in_buffer, resolve_completer_input, scroll_offset, style_suggestion,
+        truncate_with_ansi,
     },
     painting::Painter,
     Completer, Suggestion,
@@ -351,12 +352,6 @@ impl ColumnarMenu {
         self.working_details.col_width
     }
 
-    /// Reset menu position
-    fn reset_position(&mut self) {
-        self.col_pos = 0;
-        self.row_pos = 0;
-    }
-
     fn no_records_msg(&self, use_ansi_coloring: bool) -> String {
         let msg = "NO RECORDS FOUND";
         if use_ansi_coloring {
@@ -492,6 +487,70 @@ impl ColumnarMenu {
             }
         }
     }
+
+    /// Apply a queued menu event, refreshing the values or moving the selection
+    fn apply_event(
+        &mut self,
+        event: MenuEvent,
+        editor: &mut Editor,
+        completer: &mut dyn Completer,
+    ) {
+        match event {
+            MenuEvent::Activate(updated) | MenuEvent::Edit(updated) => {
+                self.reload(updated, editor, completer)
+            }
+            MenuEvent::Deactivate => {}
+            MenuEvent::NextElement => self.move_next(),
+            MenuEvent::PreviousElement => self.move_previous(),
+            MenuEvent::MoveUp => self.move_up(),
+            MenuEvent::MoveDown => self.move_down(),
+            MenuEvent::MoveLeft => self.move_left(),
+            MenuEvent::MoveRight => self.move_right(),
+            MenuEvent::PreviousPage | MenuEvent::NextPage => {
+                // The columnar menu doest have the concept of pages, yet
+            }
+        }
+    }
+
+    /// Recompute the completion box geometry from the current suggestions,
+    /// selection, and terminal size. Runs on every repaint.
+    pub fn recompute_layout(&mut self, painter: &Painter) {
+        let screen_width = painter.screen_width() as usize;
+
+        // If there is at least one suggestion that contains a description, then the layout
+        // is changed to one column to fit the description
+        let has_descriptions = self
+            .get_values()
+            .iter()
+            .any(|suggestion| suggestion.description.is_some());
+
+        if has_descriptions {
+            self.working_details.columns = 1;
+            self.working_details.col_width = screen_width;
+        } else {
+            // If no default width is found, then the total screen width is used to estimate
+            // the column width based on the default number of columns
+            let default_width = self
+                .default_details
+                .col_width
+                .unwrap_or_else(|| screen_width / self.default_details.columns as usize);
+
+            // Adjusting the working width of the column based the max line width found
+            // in the menu values
+            let required_width = self.longest_suggestion + self.default_details.col_padding;
+
+            self.working_details.col_width = required_width.max(default_width).min(screen_width);
+
+            // The working columns is adjusted based on possible number of columns
+            // that could be fitted in the screen with the calculated column width
+            let possible_columns = (screen_width / self.working_details.col_width) as u16;
+            self.working_details.columns =
+                possible_columns.min(self.default_details.columns).max(1);
+        }
+
+        let available = available_lines(painter, self.min_rows(), u16::MAX);
+        self.skip_rows = scroll_offset(self.row_pos, self.skip_rows, available);
+    }
 }
 
 impl Menu for ColumnarMenu {
@@ -550,6 +609,11 @@ impl Menu for ColumnarMenu {
     }
 
     /// Updates menu values
+    fn reset_position(&mut self) {
+        self.col_pos = 0;
+        self.row_pos = 0;
+    }
+
     fn update_values(&mut self, editor: &mut Editor, completer: &mut dyn Completer) {
         let (input, pos) = resolve_completer_input(editor, &mut self.input, &self.settings);
 
@@ -584,90 +648,10 @@ impl Menu for ColumnarMenu {
         painter: &Painter,
     ) {
         if let Some(event) = self.event.take() {
-            match event {
-                MenuEvent::Activate(updated) => {
-                    self.reset_position();
-
-                    if !updated {
-                        self.update_values(editor, completer);
-                    }
-                }
-                MenuEvent::Deactivate => {}
-                MenuEvent::Edit(updated) => {
-                    self.reset_position();
-
-                    if !updated {
-                        self.update_values(editor, completer);
-                    }
-                }
-                MenuEvent::NextElement => self.move_next(),
-                MenuEvent::PreviousElement => self.move_previous(),
-                MenuEvent::MoveUp => self.move_up(),
-                MenuEvent::MoveDown => self.move_down(),
-                MenuEvent::MoveLeft => self.move_left(),
-                MenuEvent::MoveRight => self.move_right(),
-                MenuEvent::PreviousPage | MenuEvent::NextPage => {
-                    // The columnar menu doest have the concept of pages, yet
-                }
-            }
-
-            // The working value for the menu are updated only after executing the menu events,
-            // so they have the latest suggestions
-            //
-            // If there is at least one suggestion that contains a description, then the layout
-            // is changed to one column to fit the description
-            let exist_description = self
-                .get_values()
-                .iter()
-                .any(|suggestion| suggestion.description.is_some());
-
-            let screen_width = painter.screen_width() as usize;
-            if exist_description {
-                self.working_details.columns = 1;
-                self.working_details.col_width = screen_width;
-            } else {
-                // If no default width is found, then the total screen width is used to estimate
-                // the column width based on the default number of columns
-                let default_width = if let Some(col_width) = self.default_details.col_width {
-                    col_width
-                } else {
-                    screen_width / self.default_details.columns as usize
-                };
-
-                // Adjusting the working width of the column based the max line width found
-                // in the menu values
-                self.working_details.col_width = default_width
-                    .max(self.longest_suggestion + self.default_details.col_padding)
-                    .min(screen_width);
-
-                // The working columns is adjusted based on possible number of columns
-                // that could be fitted in the screen with the calculated column width
-                let possible_cols = painter.screen_width() / self.working_details.col_width as u16;
-                if possible_cols > self.default_details.columns {
-                    self.working_details.columns = self.default_details.columns.max(1);
-                } else {
-                    self.working_details.columns = possible_cols;
-                }
-            }
-
-            let mut available_lines = painter.remaining_lines_real();
-            // Handle the case where a prompt uses the entire screen.
-            // Drawing the menu has priority over the drawing the prompt.
-            if available_lines == 0 {
-                available_lines = painter.remaining_lines().min(self.min_rows());
-            }
-
-            self.skip_rows = if self.row_pos < self.skip_rows {
-                // Selection is above the visible area, scroll up
-                self.row_pos
-            } else if self.row_pos >= self.skip_rows + available_lines {
-                // Selection is below the visible area, scroll down
-                self.row_pos - available_lines + 1
-            } else {
-                // Selection is within the visible area
-                self.skip_rows
-            };
+            self.apply_event(event, editor, completer);
         }
+
+        self.recompute_layout(painter);
     }
 
     /// The buffer gets replaced in the Span location
@@ -832,13 +816,21 @@ mod tests {
 
     struct FakeCompleter {
         completions: Vec<String>,
+        /// When set, every suggestion carries a description
+        describe: bool,
     }
 
     impl FakeCompleter {
         fn new(completions: &[&str]) -> Self {
             Self {
                 completions: completions.iter().map(|c| c.to_string()).collect(),
+                describe: false,
             }
+        }
+
+        fn with_descriptions(mut self) -> Self {
+            self.describe = true;
+            self
         }
     }
 
@@ -846,7 +838,10 @@ mod tests {
         fn complete(&mut self, _line: &str, pos: usize) -> Vec<Suggestion> {
             self.completions
                 .iter()
-                .map(|c| fake_suggestion(c, pos))
+                .map(|c| Suggestion {
+                    description: self.describe.then(|| format!("desc for {c}")),
+                    ..fake_suggestion(c, pos)
+                })
                 .collect()
         }
     }
@@ -1065,5 +1060,32 @@ mod tests {
             menu.move_down();
             assert!(menu.row_pos == 0 && menu.col_pos == 1);
         }
+    }
+
+    #[test]
+    fn layout_recomputes_without_a_menu_event() {
+        let mut menu = ColumnarMenu::default().with_name("testmenu");
+        let mut editor = Editor::default();
+        let mut painter = Painter::new(W::sink());
+        painter.handle_resize(120, 10);
+
+        let mut plain = FakeCompleter::new(&["alpha", "beta", "gamma"]);
+        menu.menu_event(MenuEvent::Activate(false));
+        menu.update_working_details(&mut editor, &mut plain, &painter);
+        assert!(
+            menu.get_cols() > 1,
+            "expected a multi-column layout without descriptions"
+        );
+
+        let mut described = FakeCompleter::new(&["alpha", "beta", "gamma"]).with_descriptions();
+        menu.update_values(&mut editor, &mut described);
+        assert!(menu.event.is_none(), "no menu event should be queued");
+        menu.update_working_details(&mut editor, &mut described, &painter);
+
+        assert_eq!(
+            menu.get_cols(),
+            1,
+            "descriptions must relayout to one column without a menu event"
+        );
     }
 }
