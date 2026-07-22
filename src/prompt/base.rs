@@ -1,6 +1,6 @@
 use {
     crate::core_editor::{RestPolicy, SelectionExtent},
-    crossterm::style::Color,
+    nu_ansi_term::Color,
     serde::{Deserialize, Serialize},
     std::{
         borrow::Cow,
@@ -9,11 +9,20 @@ use {
     strum::{EnumIter, EnumString, IntoDiscriminant},
 };
 
-/// The default color for the prompt, indicator, and right prompt
-pub static DEFAULT_PROMPT_COLOR: Color = Color::Green;
-pub static DEFAULT_PROMPT_MULTILINE_COLOR: nu_ansi_term::Color = nu_ansi_term::Color::LightBlue;
-pub static DEFAULT_INDICATOR_COLOR: Color = Color::Cyan;
-pub static DEFAULT_PROMPT_RIGHT_COLOR: Color = Color::AnsiValue(5);
+// The *light* variants are deliberate. Before the nu-ansi-term migration these
+// were crossterm's `Color::Green`/`Color::Cyan`, which are palette 10 and 14;
+// crossterm spells the dark ones `DarkGreen`/`DarkCyan`. nu-ansi-term has no
+// `Dark*` prefix, so its `Green` is palette 2. Naming them here would darken
+// every default prompt.
+
+/// The default color for the prompt
+pub static DEFAULT_PROMPT_COLOR: Color = Color::LightGreen;
+/// The default color for the multiline prompt indicator
+pub static DEFAULT_PROMPT_MULTILINE_COLOR: Color = Color::LightBlue;
+/// The default color for the prompt indicator
+pub static DEFAULT_INDICATOR_COLOR: Color = Color::LightCyan;
+/// The default color for the right prompt
+pub static DEFAULT_PROMPT_RIGHT_COLOR: Color = Color::Purple;
 
 /// The current success/failure of the history search
 pub enum PromptHistorySearchStatus {
@@ -192,7 +201,7 @@ pub trait Prompt: Send {
         DEFAULT_PROMPT_COLOR
     }
     /// Get the default multiline prompt color
-    fn get_prompt_multiline_color(&self) -> nu_ansi_term::Color {
+    fn get_prompt_multiline_color(&self) -> Color {
         DEFAULT_PROMPT_MULTILINE_COLOR
     }
     /// Get the default indicator color
